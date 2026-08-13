@@ -1,17 +1,239 @@
-name: taka
+name: Hanz-Aerohost - Auto Restart
 
-on: workflow_dispatch  
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Durasi total (jam, maks 720 = 30 hari)'
+        required: true
+        default: '24'
+        type: choice
+        options:
+          - '1'
+          - '6'
+          - '12'
+          - '24'
+          - '48'
+          - '72'
+          - '168'
+          - '336'
+          - '720'
+      password:
+        description: 'Password SSH root (kosongkan = auto-generate)'
+        required: false
+        type: string
+
+  schedule:
+    - cron: '*/30 * * * *'
 
 jobs:
-  build:
+  ssh-debug:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   
+    timeout-minutes: 43200
+    continue-on-error: false
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Restore State from Artifact
+        id: restore
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ssh-state
+          path: /tmp/
 
-    - name: Setup tmate session
-      uses: mxschmitt/action-tmate@v3
-      with:
-        limit-access-to-actor: false
+      - name: Setup Hanz-Aerohost Server
+        id: setup
+        run: |
+          TOTAL_HOURS=${{ github.event.inputs.duration || '24' }}
+          STATE_FILE="/tmp/ssh_state"
+          TUNNEL_FILE="/tmp/tunnel_host"
+          PASS_FILE="/tmp/root_pass"
+          
+          # === SET HOSTNAME ===
+          sudo hostnamectl set-hostname Hanz-Aerohost
+          sudo sed -i "s/127.0.1.1.*/127.0.1.1 Hanz-Aerohost/" /etc/hosts
+          echo "✅ Hostname: Hanz-Aerohost"
+          
+          # === Jika state ada, baca ===
+          if [ -f "$STATE_FILE" ]; then
+            REMAINING=$(cat "$STATE_FILE")
+            TUNNEL_HOST=$(cat "$TUNNEL_FILE" 2>/dev/null || echo "")
+            ROOT_PASS=$(cat "$PASS_FILE" 2>/dev/null || echo "")
+            echo "📂 State ditemukan, sisa: ${REMAINING} jam"
+          else
+            # === State tidak ada → Generate baru ===
+            REMAINING=$TOTAL_HOURS
+            echo "$REMAINING" > "$STATE_FILE"
+            
+            # Generate password
+            if [ -n "${{ github.event.inputs.password }}" ]; then
+              ROOT_PASS="${{ github.event.inputs.password }}"
+            else
+              ROOT_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 16)
+            fi
+            echo "$ROOT_PASS" > "$PASS_FILE"
+            
+            # Setup SSH
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server curl figlet toilet
+            curl -sL "https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/cloudflared-linux-amd64" \
+              -o /tmp/cloudflared && chmod +x /tmp/cloudflared && sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+            
+            echo "root:${ROOT_PASS}" | sudo chpasswd
+            sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+            sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+            sudo sed -i 's/UsePAM yes/UsePAM no/' /etc/ssh/sshd_config
+            sudo mkdir -p /run/sshd
+            sudo ssh-keygen -A
+            sudo /usr/sbin/sshd
+            
+            # === BUAT BANNER UNTUK SSH LOGIN ===
+            sudo bash -c 'cat > /etc/profile.d/hanz-banner.sh << "EOF"
+#!/bin/bash
+if [ "$TERM" != "linux" ] && [ -t 1 ]; then
+  clear
+  echo ""
+  echo -e "\e[1;31m"
+  echo "  ██╗  ██╗ █████╗ ███╗   ██╗███████╗     █████╗ ███████╗██████╗  ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗"
+  echo "  ██║  ██║██╔══██╗████╗  ██║╚══███╔╝    ██╔══██╗██╔════╝██╔══██╗██╔═══██╗██║  ██║██╔═══██╗██╔════╝╚══██╔══╝"
+  echo "  ███████║███████║██╔██╗ ██║  ███╔╝     ███████║█████╗  ██████╔╝██║   ██║███████║██║   ██║███████╗   ██║   "
+  echo "  ██╔══██║██╔══██║██║╚██╗██║ ███╔╝      ██╔══██║██╔══╝  ██╔══██╗██║   ██║██╔══██║██║   ██║╚════██║   ██║   "
+  echo "  ██║  ██║██║  ██║██║ ╚████║███████╗    ██║  ██║███████╗██║  ██║╚██████╔╝██║  ██║╚██████╔╝███████║   ██║   "
+  echo "  ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝    ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   "
+  echo -e "\e[0m"
+  
+  echo -e "\e[1;31m═══════════════════════════════════════════════════════════════════════════════════\e[0m"
+  echo -e "\e[1;37m                              ✦ HANZ-AEROHOST PRESENTS ✦\e[0m"
+  echo -e "\e[1;31m═══════════════════════════════════════════════════════════════════════════════════\e[0m"
+  echo ""
+  
+  echo -e "\e[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo -e "\e[1;33m                           📊 SERVER STATISTICS\e[0m"
+  echo -e "\e[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo ""
+  
+  IP=$(curl -s ifconfig.me 2>/dev/null || echo "N/A")
+  CPU_MODEL=$(lscpu | grep "Model name" | cut -d":" -f2 | xargs | cut -c1-30 2>/dev/null || echo "Unknown")
+  CPU_CORES=$(nproc 2>/dev/null || echo "?")
+  TOTAL_RAM=$(free -h | grep Mem | awk "{print \$2}" 2>/dev/null || echo "N/A")
+  USED_RAM=$(free -h | grep Mem | awk "{print \$3}" 2>/dev/null || echo "N/A")
+  DISK=$(df -h / | awk "NR==2 {print \$2}" 2>/dev/null || echo "N/A")
+  
+  printf "\e[1;32m┌─────────────────────────────────────────────────────────────────────────────┐\e[0m\n"
+  printf "\e[1;32m│\e[0m \e[1;37m🖥️  HOSTNAME     :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "Hanz-Aerohost"
+  printf "\e[1;32m│\e[0m \e[1;37m🌐  IP VPS       :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "$IP"
+  printf "\e[1;32m│\e[0m \e[1;37m🔌  PORT SSH     :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "22"
+  printf "\e[1;32m│\e[0m \e[1;37m👤  USERNAME     :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "root"
+  printf "\e[1;32m├─────────────────────────────────────────────────────────────────────────────┤\e[0m\n"
+  printf "\e[1;32m│\e[0m \e[1;37m💻  CPU          :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "$CPU_MODEL ($CPU_CORES Core)"
+  printf "\e[1;32m│\e[0m \e[1;37m🧠  RAM          :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "$USED_RAM / $TOTAL_RAM"
+  printf "\e[1;32m│\e[0m \e[1;37m💾  DISK         :\e[0m \e[1;32m%-50s\e[0m \e[1;32m│\e[0m\n" "$DISK"
+  printf "\e[1;32m└─────────────────────────────────────────────────────────────────────────────┘\e[0m\n"
+  
+  echo ""
+  echo -e "\e[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo -e "\e[1;32m  ✅ SELAMAT DATANG DI HANZ-AEROHOST VPS!\e[0m"
+  echo -e "\e[1;33m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo ""
+fi
+EOF'
+            
+            sudo chmod +x /etc/profile.d/hanz-banner.sh
+            
+            # Start Cloudflare Tunnel
+            cloudflared tunnel --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
+            TUNNEL_HOST=""
+            for i in $(seq 1 30); do
+              TUNNEL_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+              [ -n "$TUNNEL_HOST" ] && break
+              sleep 2
+            done
+            echo "$TUNNEL_HOST" > "$TUNNEL_FILE"
+            
+            echo "🆕 State baru dibuat, durasi: ${REMAINING} jam"
+          fi
+          
+          # === Kalau sisa <= 0, matikan ===
+          if [ "$REMAINING" -le 0 ]; then
+            echo "⏰ Waktu habis! Hapus state & matikan."
+            rm -f "$STATE_FILE" "$TUNNEL_FILE" "$PASS_FILE"
+            echo "timeout=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # === Ambil Info Server ===
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          
+          echo "remaining=${REMAINING}" >> $GITHUB_OUTPUT
+          echo "timeout=false" >> $GITHUB_OUTPUT
+          echo "tunnel_host=${TUNNEL_HOST}" >> $GITHUB_OUTPUT
+          echo "root_pass=${ROOT_PASS}" >> $GITHUB_OUTPUT
+          echo "public_ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
+
+      - name: Tampilkan Info di Log
+        if: steps.setup.outputs.timeout == 'false'
+        env:
+          REMAINING: ${{ steps.setup.outputs.remaining }}
+          TUNNEL_HOST: ${{ steps.setup.outputs.tunnel_host }}
+          ROOT_PASS: ${{ steps.setup.outputs.root_pass }}
+          PUBLIC_IP: ${{ steps.setup.outputs.public_ip }}
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    🚀 HANZ-AEROHOST VPS                      ║"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          printf "║ %-58s ║\n" "📌 Hostname    : Hanz-Aerohost"
+          printf "║ %-58s ║\n" "📌 IP Publik   : ${PUBLIC_IP}"
+          printf "║ %-58s ║\n" "📌 Port SSH    : 22"
+          printf "║ %-58s ║\n" "📌 User        : root"
+          printf "║ %-58s ║\n" "📌 Password    : ${ROOT_PASS}"
+          printf "║ %-58s ║\n" "📌 Tunnel      : ${TUNNEL_HOST}"
+          printf "║ %-58s ║\n" "📌 Sisa Durasi : ${REMAINING} jam"
+          echo "╠════════════════════════════════════════════════════════════════╣"
+          echo "║ ✅ SSH Command (via Tunnel):                                  ║"
+          printf "║ %-58s ║\n" "ssh -o ProxyCommand=\"cloudflared access tcp --hostname ${TUNNEL_HOST}\" root@${TUNNEL_HOST}"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+
+      - name: Keep Alive & Update State
+        if: steps.setup.outputs.timeout == 'false'
+        env:
+          REMAINING: ${{ steps.setup.outputs.remaining }}
+        run: |
+          STATE_FILE="/tmp/ssh_state"
+          
+          while [ -f "$STATE_FILE" ] && [ $(cat "$STATE_FILE") -gt 0 ]; do
+            CURRENT=$(cat "$STATE_FILE")
+            NEW=$((CURRENT - 1))
+            echo "$NEW" > "$STATE_FILE"
+            echo "⏱️ Hanz-Aerohost - Sisa: ${NEW} jam"
+            
+            if [ "$NEW" -eq 0 ]; then
+              echo "⏰ Waktu habis!"
+              rm -f "$STATE_FILE" /tmp/tunnel_host /tmp/root_pass
+              break
+            fi
+            sleep 3600
+          done
+
+      - name: Save State to Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-state
+          path: |
+            /tmp/ssh_state
+            /tmp/tunnel_host
+            /tmp/root_pass
+          retention-days: 30
+
+      - name: Auto Restart on Failure
+        if: failure() && github.event_name == 'workflow_dispatch'
+        run: |
+          echo "🔄 Hanz-Aerohost - Restart otomatis..."
+          sleep 5
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
+            -d '{"ref":"main","inputs":{"duration":"${{ github.event.inputs.duration }}","password":"${{ github.event.inputs.password }}"}}'
