@@ -1,0 +1,65 @@
+name: Hanz-Aerohost VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Durasi (jam)'
+        required: true
+        default: '24'
+        type: choice
+        options:
+          - '1'
+          - '6'
+          - '12'
+          - '24'
+          - '48'
+          - '72'
+          - '168'
+          - '336'
+          - '720'
+      password:
+        description: 'Password root (kosong = auto)'
+        required: false
+        type: string
+
+jobs:
+  ssh-debug:
+    runs-on: self-hosted
+    timeout-minutes: 43200
+
+    steps:
+      - name: Setup Hanz-Aerohost
+        run: |
+          sudo hostnamectl set-hostname Hanz-Aerohost
+          
+          if [ -n "${{ github.event.inputs.password }}" ]; then
+            ROOT_PASS="${{ github.event.inputs.password }}"
+          else
+            ROOT_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 16)
+          fi
+          
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-server curl
+          
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          sudo /usr/sbin/sshd
+          
+          PUBLIC_IP=$(curl -s ifconfig.me)
+          
+          echo "Hostname: Hanz-Aerohost"
+          echo "IP: $PUBLIC_IP"
+          echo "User: root"
+          echo "Password: $ROOT_PASS"
+          echo ""
+          echo "ssh root@$PUBLIC_IP"
+
+      - name: Keep Alive
+        run: |
+          HOURS=${{ github.event.inputs.duration }}
+          SECONDS=$((HOURS * 3600))
+          sleep $SECONDS
