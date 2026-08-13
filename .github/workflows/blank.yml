@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: 'Durasi (jam)'
+        description: 'Durasi (jam, maks 720 = 30 hari)'
         required: true
         default: '24'
         type: choice
@@ -23,67 +23,107 @@ on:
         required: false
         type: string
 
+  schedule:
+    - cron: '*/30 * * * *'
+
 jobs:
   ssh-debug:
     runs-on: ubuntu-latest
     timeout-minutes: 43200
+    continue-on-error: false
 
     steps:
+      - name: Restore State
+        id: restore
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ssh-state
+          path: /tmp/
+
       - name: Setup Hanz-Aerohost
         id: setup
         run: |
+          TOTAL_HOURS=${{ github.event.inputs.duration || '24' }}
+          STATE_FILE="/tmp/ssh_state"
+          TUNNEL_FILE="/tmp/tunnel_host"
+          PASS_FILE="/tmp/root_pass"
+          
           # SET HOSTNAME
           sudo hostnamectl set-hostname Hanz-Aerohost
           
-          # PASSWORD
-          if [ -n "${{ github.event.inputs.password }}" ]; then
-            ROOT_PASS="${{ github.event.inputs.password }}"
+          # CEK STATE
+          if [ -f "$STATE_FILE" ]; then
+            REMAINING=$(cat "$STATE_FILE")
+            TUNNEL_HOST=$(cat "$TUNNEL_FILE" 2>/dev/null || echo "")
+            ROOT_PASS=$(cat "$PASS_FILE" 2>/dev/null || echo "")
+            echo "📂 State ditemukan, sisa: ${REMAINING} jam"
           else
-            ROOT_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 16)
+            REMAINING=$TOTAL_HOURS
+            echo "$REMAINING" > "$STATE_FILE"
+            
+            # PASSWORD
+            if [ -n "${{ github.event.inputs.password }}" ]; then
+              ROOT_PASS="${{ github.event.inputs.password }}"
+            else
+              ROOT_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9' | head -c 16)
+            fi
+            echo "$ROOT_PASS" > "$PASS_FILE"
+            
+            # SETUP SSH
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openssh-server curl
+            
+            echo "root:${ROOT_PASS}" | sudo chpasswd
+            sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+            sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+            sudo mkdir -p /run/sshd
+            sudo ssh-keygen -A
+            sudo /usr/sbin/sshd
+            
+            # INSTALL CLOUDFLARED
+            curl -sL "https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/cloudflared-linux-amd64" -o /tmp/cloudflared
+            chmod +x /tmp/cloudflared
+            sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+            
+            # START TUNNEL
+            cloudflared tunnel --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
+            sleep 8
+            TUNNEL_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
+            echo "$TUNNEL_HOST" > "$TUNNEL_FILE"
           fi
           
-          # INSTALL SSH
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openssh-server curl
+          # KALAU WAKTU HABIS
+          if [ "$REMAINING" -le 0 ]; then
+            rm -f "$STATE_FILE" "$TUNNEL_FILE" "$PASS_FILE"
+            echo "timeout=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
-          # CONFIG SSH
-          echo "root:${ROOT_PASS}" | sudo chpasswd
-          sudo sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo mkdir -p /run/sshd
-          sudo ssh-keygen -A
-          sudo /usr/sbin/sshd
-          
-          # INSTALL CLOUDFLARED
-          curl -sL "https://github.com/cloudflare/cloudflared/releases/download/2024.12.2/cloudflared-linux-amd64" -o /tmp/cloudflared
-          chmod +x /tmp/cloudflared
-          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
-          
-          # START TUNNEL
-          cloudflared tunnel --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
-          sleep 8
-          TUNNEL_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1)
           PUBLIC_IP=$(curl -s ifconfig.me)
           CPU_CORES=$(nproc)
           TOTAL_RAM=$(free -h | grep Mem | awk '{print $2}')
           DISK=$(df -h / | awk 'NR==2 {print $2}')
           
-          echo "root_pass=${ROOT_PASS}" >> $GITHUB_OUTPUT
+          echo "remaining=${REMAINING}" >> $GITHUB_OUTPUT
+          echo "timeout=false" >> $GITHUB_OUTPUT
           echo "tunnel_host=${TUNNEL_HOST}" >> $GITHUB_OUTPUT
+          echo "root_pass=${ROOT_PASS}" >> $GITHUB_OUTPUT
           echo "public_ip=${PUBLIC_IP}" >> $GITHUB_OUTPUT
           echo "cpu_cores=${CPU_CORES}" >> $GITHUB_OUTPUT
           echo "total_ram=${TOTAL_RAM}" >> $GITHUB_OUTPUT
           echo "disk=${DISK}" >> $GITHUB_OUTPUT
 
       - name: Tampilkan Info
+        if: steps.setup.outputs.timeout == 'false'
         env:
+          REMAINING: ${{ steps.setup.outputs.remaining }}
           ROOT_PASS: ${{ steps.setup.outputs.root_pass }}
           TUNNEL_HOST: ${{ steps.setup.outputs.tunnel_host }}
           PUBLIC_IP: ${{ steps.setup.outputs.public_ip }}
           CPU_CORES: ${{ steps.setup.outputs.cpu_cores }}
           TOTAL_RAM: ${{ steps.setup.outputs.total_ram }}
           DISK: ${{ steps.setup.outputs.disk }}
-          DURATION: ${{ github.event.inputs.duration }}
         run: |
           echo ""
           echo "╔════════════════════════════════════════════════════════════════╗"
@@ -91,24 +131,52 @@ jobs:
           echo "╠════════════════════════════════════════════════════════════════╣"
           echo "║ Hostname    : Hanz-Aerohost                                   ║"
           echo "║ IP Publik   : ${PUBLIC_IP}                                    ║"
-          echo "║ Port SSH    : 22                                              ║"
+          echo "║ Tunnel      : ${TUNNEL_HOST}                                  ║"
           echo "║ User        : root                                            ║"
           echo "║ Password    : ${ROOT_PASS}                                    ║"
-          echo "║ Tunnel      : ${TUNNEL_HOST}                                  ║"
           echo "╠════════════════════════════════════════════════════════════════╣"
           echo "║ CPU Cores   : ${CPU_CORES}                                    ║"
           echo "║ RAM         : ${TOTAL_RAM}                                    ║"
           echo "║ Disk        : ${DISK}                                         ║"
-          echo "║ Durasi      : ${DURATION} jam                                 ║"
+          echo "║ Sisa Durasi : ${REMAINING} jam                                ║"
           echo "╠════════════════════════════════════════════════════════════════╣"
           echo "║ ✅ SSH Command:                                               ║"
           echo "║ ssh -o ProxyCommand=\"cloudflared access tcp                 ║"
           echo "║      --hostname ${TUNNEL_HOST}\" root@${TUNNEL_HOST}          ║"
           echo "╚════════════════════════════════════════════════════════════════╝"
 
-      - name: Keep Alive
+      - name: Keep Alive & Update State
+        if: steps.setup.outputs.timeout == 'false'
         run: |
-          HOURS=${{ github.event.inputs.duration }}
-          SECONDS=$((HOURS * 3600))
-          echo "⏱️ Server aktif ${HOURS} jam"
-          sleep $SECONDS
+          STATE_FILE="/tmp/ssh_state"
+          while [ -f "$STATE_FILE" ] && [ $(cat "$STATE_FILE") -gt 0 ]; do
+            CURRENT=$(cat "$STATE_FILE")
+            NEW=$((CURRENT - 1))
+            echo "$NEW" > "$STATE_FILE"
+            echo "⏱️ Sisa: ${NEW} jam"
+            if [ "$NEW" -eq 0 ]; then
+              rm -f "$STATE_FILE" /tmp/tunnel_host /tmp/root_pass
+              break
+            fi
+            sleep 3600
+          done
+
+      - name: Save State
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssh-state
+          path: |
+            /tmp/ssh_state
+            /tmp/tunnel_host
+            /tmp/root_pass
+          retention-days: 30
+
+      - name: Auto Restart
+        if: failure() && github.event_name == 'workflow_dispatch'
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" \
+            -d '{"ref":"main","inputs":{"duration":"${{ github.event.inputs.duration }}","password":"${{ github.event.inputs.password }}"}}'
